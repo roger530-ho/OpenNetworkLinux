@@ -113,3 +113,107 @@ as9817_64_platform_id_t get_platform_id(void)
 
     return (pid == 0) ? AS9817_64O : AS9817_64D;
 }
+
+/**
+ * Read multiple bytes from an I2C device at specified register offset.
+ * Automatically opens/closes /dev/i2c-X
+ *
+ * @param bus I2C bus number (e.g., 0 for /dev/i2c-0)
+ * @param addr I2C slave address
+ * @param reg Start register offset
+ * @param buf Buffer to store data
+ * @param len Number of bytes to read
+ * @return 0 on success, < 0 on failure
+ */
+int i2cget_bytes(int bus, uint8_t addr, uint8_t reg, uint8_t *buf, size_t len)
+{
+    char dev_path[32];
+    int fd;
+
+    if (len == 0 || len > 32) {
+        AIM_LOG_ERROR("Invalid I2C read length: %zu (must be 1 to 32)\n", len);
+        return ONLP_STATUS_E_INVALID;
+    }
+
+    if (snprintf(dev_path, sizeof(dev_path), "/dev/i2c-%d", bus) >= (int)sizeof(dev_path)) {
+        AIM_LOG_ERROR("Device path too long\n");
+        return ONLP_STATUS_E_INVALID;
+    }
+
+    fd = open(dev_path, O_RDWR);
+    if (fd < 0) {
+        AIM_LOG_ERROR("Failed to open %s\n", dev_path);
+        return ONLP_STATUS_E_INTERNAL;
+    }
+
+    if (ioctl(fd, I2C_SLAVE, addr) < 0) {
+        AIM_LOG_ERROR("Failed to set I2C slave 0x%02X\n", addr);
+        close(fd);
+        return ONLP_STATUS_E_INTERNAL;
+    }
+
+    if (i2c_smbus_read_i2c_block_data(fd, reg, len, buf) < 0) {
+        AIM_LOG_ERROR("SMBus block read failed at reg 0x%02X\n", reg);
+        close(fd);
+        return ONLP_STATUS_E_INTERNAL;
+    }
+
+    close(fd);
+    return ONLP_STATUS_OK;
+}
+
+/**
+ * get_bmc_version - Get BMC version as int array
+ * @ver: int[3], ver[0]=major, ver[1]=minor, ver[2]=aux last byte
+ *
+ * Return: ONLP_STATUS_OK on success, or ONLP error code
+ */
+int get_bmc_version(int *ver)
+{
+    char *tmp;
+    char primary_fw_ver[32] = {0};
+    char aux_fw_raw[64] = {0};
+    const char *last_aux = NULL;
+    int len;
+
+    if (!ver) {
+        return ONLP_STATUS_E_INVALID;
+    }
+    memset(ver, 0, sizeof(int) * 3);
+
+    len = onlp_file_read_str(&tmp, BMC_VER1_PATH);
+    if (tmp && len) {
+        memcpy(primary_fw_ver, tmp, len);
+        primary_fw_ver[len] = '\0';
+    } else {
+        return ONLP_STATUS_E_INTERNAL;
+    }
+    AIM_FREE_IF_PTR(tmp);
+
+    len = onlp_file_read_str(&tmp, BMC_VER2_PATH);
+    if (tmp && len) {
+        memcpy(aux_fw_raw, tmp, len);
+        aux_fw_raw[len] = '\0';
+    } else {
+        return ONLP_STATUS_E_INTERNAL;
+    }
+    AIM_FREE_IF_PTR(tmp);
+
+    primary_fw_ver[strcspn(primary_fw_ver, "\n")] = '\0';
+    aux_fw_raw[strcspn(aux_fw_raw, "\n")] = '\0';
+
+    /* Parse main version: "0.3" => ver[0]=0, ver[1]=3 */
+    if (sscanf(primary_fw_ver, "%d.%d", &ver[0], &ver[1]) != 2) {
+        return ONLP_STATUS_E_INTERNAL;
+    }
+
+    /* Get last AUX byte (e.g., from "0x00 0x00 0x00 0x02") */
+    last_aux = strrchr(aux_fw_raw, ' ');
+    last_aux = last_aux ? last_aux + 1 : aux_fw_raw;
+
+    if (sscanf(last_aux, "0x%x", &ver[2]) != 1) {
+        return ONLP_STATUS_E_INTERNAL;
+    }
+
+    return ONLP_STATUS_OK;
+}

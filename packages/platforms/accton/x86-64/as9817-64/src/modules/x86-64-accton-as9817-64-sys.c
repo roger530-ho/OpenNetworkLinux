@@ -41,13 +41,22 @@
 
 #define IPMI_CPLD_READ_CMD 0x20
 #define IPMI_OTP_PROTECT_CMD 0x94
+#define IPMI_GET_FAN_CONTROLLER_CMD 0x66
+#define IPMI_SET_FAN_CONTROLLER_CMD 0x67
+#define IPMI_SEND_THERMAL_DATA_CMD 0x13
 
 static void ipmi_msg_handler(struct ipmi_recv_msg *msg, void *user_msg_data);
 static int as9817_64_sys_probe(struct platform_device *pdev);
 static int as9817_64_sys_remove(struct platform_device *pdev);
 static ssize_t show_version(struct device *dev,
                                 struct device_attribute *da, char *buf);
+static ssize_t get_bmc_fan_controller(struct device *dev,
+                                          struct device_attribute *da, char *buf);
 static ssize_t set_otp_protect(struct device *dev, struct device_attribute *da,
+            const char *buf, size_t count);
+static ssize_t set_bmc_fan_controller(struct device *dev, struct device_attribute *da,
+            const char *buf, size_t count);
+static ssize_t set_bmc_thermal_data(struct device *dev, struct device_attribute *da,
             const char *buf, size_t count);
 
 struct ipmi_data {
@@ -74,7 +83,8 @@ struct as9817_64_sys_data {
     unsigned long last_updated;    /* In jiffies */
     struct ipmi_data ipmi;
     unsigned char ipmi_resp_cpld[2];
-    unsigned char ipmi_tx_data[2];
+    unsigned char ipmi_resp_fan_controller[1];
+    unsigned char ipmi_tx_data[3];
 };
 
 struct as9817_64_sys_data *data = NULL;
@@ -90,15 +100,23 @@ static struct platform_driver as9817_64_sys_driver = {
 
 enum as9817_64_sys_sysfs_attrs {
     FPGA_VER, /* FPGA version */
-    OTP_PROTECT
+    OTP_PROTECT,
+    FAN_CONTROLLER,
+    THERMAL_DATA
 };
 
 static SENSOR_DEVICE_ATTR(fpga_version, S_IRUGO, show_version, NULL, FPGA_VER);
 static SENSOR_DEVICE_ATTR(otp_protect, S_IWUSR, NULL, set_otp_protect, OTP_PROTECT);
+static SENSOR_DEVICE_ATTR(bmc_fan_controller, S_IRUGO|S_IWUSR, 
+                          get_bmc_fan_controller, set_bmc_fan_controller, 
+                          FAN_CONTROLLER);
+static SENSOR_DEVICE_ATTR(bmc_thermal_data, S_IWUSR, NULL, set_bmc_thermal_data, THERMAL_DATA);
 
 static struct attribute *as9817_64_sys_attributes[] = {
     &sensor_dev_attr_fpga_version.dev_attr.attr,
     &sensor_dev_attr_otp_protect.dev_attr.attr,
+    &sensor_dev_attr_bmc_fan_controller.dev_attr.attr,
+    &sensor_dev_attr_bmc_thermal_data.dev_attr.attr,
     NULL
 };
 
@@ -311,6 +329,53 @@ exit:
     return error;
 }
 
+static struct as9817_64_sys_data *as9817_64_sys_update_fan_controller(void)
+{
+    int status = 0;
+
+    data->valid = 0;
+    status = ipmi_send_message(&data->ipmi, IPMI_GET_FAN_CONTROLLER_CMD,
+                                NULL, 0,
+                                data->ipmi_resp_fan_controller,
+                                sizeof(data->ipmi_resp_fan_controller));
+    if (unlikely(status != 0))
+        goto exit;
+
+    if (unlikely(data->ipmi.rx_result != 0)) {
+        status = -EIO;
+        goto exit;
+    }
+
+    data->last_updated = jiffies;
+    data->valid = 1;
+
+exit:
+    return data;
+}
+
+static ssize_t get_bmc_fan_controller(struct device *dev,
+                                          struct device_attribute *da, char *buf)
+{
+    unsigned char status;
+    int error = 0;
+
+    mutex_lock(&data->update_lock);
+
+    data = as9817_64_sys_update_fan_controller();
+    if (!data->valid) {
+        error = -EIO;
+        goto exit;
+    }
+
+    status = data->ipmi_resp_fan_controller[0];
+    mutex_unlock(&data->update_lock);
+    return sprintf(buf, "%d\n", status);
+
+exit:
+    mutex_unlock(&data->update_lock);
+    return error;
+}
+
 static ssize_t set_otp_protect(struct device *dev, struct device_attribute *da,
             const char *buf, size_t count)
 {
@@ -335,6 +400,94 @@ static ssize_t set_otp_protect(struct device *dev, struct device_attribute *da,
 
     if (unlikely(data->ipmi.rx_result != 0)) {
         status = -EIO;
+        goto exit;
+    }
+
+    status = count;
+
+exit:
+    mutex_unlock(&data->update_lock);
+    return status;
+}
+
+static ssize_t set_bmc_fan_controller(struct device *dev, struct device_attribute *da,
+            const char *buf, size_t count)
+{
+    long enable;
+    int status;
+
+    status = kstrtol(buf, 10, &enable);
+    if (status)
+        return status;
+
+    mutex_lock(&data->update_lock);
+
+    data->ipmi_tx_data[0] = 0;
+    data->ipmi_tx_data[1] = 2;
+    if (enable) {
+        data->ipmi_tx_data[1] = 3;
+    }
+    status = ipmi_send_message(&data->ipmi, IPMI_SET_FAN_CONTROLLER_CMD,
+                                data->ipmi_tx_data, 2,
+                                NULL, 0);
+    if (unlikely(status != 0))
+        goto exit;
+
+    if (unlikely(data->ipmi.rx_result != 0)) {
+        status = -EINVAL;
+        goto exit;
+    }
+
+    status = count;
+
+exit:
+    mutex_unlock(&data->update_lock);
+    return status;
+}
+
+
+static ssize_t set_bmc_thermal_data(struct device *dev, struct device_attribute *da,
+            const char *buf, size_t count)
+{
+    int status;
+    int args;
+    char *opt, tmp[32] = {0};
+    char *tmp_p;
+    size_t copy_size;
+    u8 input[3] = {0};
+
+    copy_size = (count < sizeof(tmp)) ? count : sizeof(tmp) - 1;
+    #ifdef __STDC_LIB_EXT1__
+    memcpy_s(tmp, copy_size, buf, copy_size);
+    #else
+    memcpy(tmp, buf, copy_size);
+    #endif
+    tmp[copy_size] = '\0';
+
+    args = 0;
+    tmp_p = strim(tmp);
+    while (args < 3 && (opt = strsep(&tmp_p, " ")) != NULL) {
+        if (kstrtou8(opt, 10, &input[args]) == 0) {
+            args++;
+        }
+    }
+    if (args != 3) {
+        return -EINVAL;
+    }
+
+    mutex_lock(&data->update_lock);
+
+    data->ipmi_tx_data[0] = input[0];
+    data->ipmi_tx_data[1] = input[1];
+    data->ipmi_tx_data[2] = input[2];
+    status = ipmi_send_message(&data->ipmi, IPMI_SEND_THERMAL_DATA_CMD,
+                                data->ipmi_tx_data, 3,
+                                NULL, 0);
+    if (unlikely(status != 0))
+        goto exit;
+
+    if (unlikely(data->ipmi.rx_result != 0)) {
+        status = -EINVAL;
         goto exit;
     }
 
